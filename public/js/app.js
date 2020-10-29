@@ -1411,8 +1411,8 @@ angular.module('cerebro').controller('OverviewController', ['$scope', '$http',
       OverviewDataService.getIndexMapping(index, displayInfo, error);
     };
 
-    $scope.disableShardAllocation = function() {
-      OverviewDataService.disableShardAllocation(success, error);
+    $scope.disableShardAllocation = function(kind) {
+      OverviewDataService.disableShardAllocation(kind, success, error);
     };
 
     $scope.enableShardAllocation = function() {
@@ -1515,8 +1515,8 @@ angular.module('cerebro').factory('OverviewDataService', ['DataService',
       DataService.send('overview/enable_shard_allocation', {}, success, error);
     };
 
-    this.disableShardAllocation = function(success, error) {
-      DataService.send('overview/disable_shard_allocation', {}, success, error);
+    this.disableShardAllocation = function(kind, success, error) {
+      DataService.send('overview/disable_shard_allocation', {kind: kind}, success, error);
     };
 
     this.getShardStats = function(index, node, shard, success, error) {
@@ -1674,10 +1674,10 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
     $scope.editor = undefined;
     $scope.response = undefined;
 
-    $scope.mappings = undefined;
+    $scope.indices = undefined;
     $scope.host = undefined;
 
-    $scope.method = 'POST';
+    $scope.method = 'GET';
     $scope.path = '';
     $scope.options = [];
 
@@ -1707,11 +1707,11 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
       RestDataService.load(
         function(response) {
           $scope.host = response.host;
-          $scope.mappings = response.mappings;
+          $scope.indices = response.indices;
           $scope.updateOptions($scope.path);
         },
         function(error) {
-          AlertService.error('Error while loading cluster mappings', error);
+          AlertService.error('Error while loading cluster indices', error);
         }
       );
       $scope.loadHistory();
@@ -1736,8 +1736,8 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
     };
 
     $scope.updateOptions = function(text) {
-      if ($scope.mappings) {
-        var autocomplete = new URLAutocomplete($scope.mappings);
+      if ($scope.indices) {
+        var autocomplete = new URLAutocomplete($scope.indices);
         $scope.options = autocomplete.getAlternatives(text);
       }
     };
@@ -1748,8 +1748,31 @@ angular.module('cerebro').controller('RestController', ['$scope', '$http',
       if (path.substring(0, 1) !== '/') {
         path = '/' + path;
       }
-      var body = JSON.stringify($scope.editor.getValue(), undefined, 1);
-      var curl = 'curl -X' + method + ' \'' + $scope.host + path + '\'';
+
+      var matchesAPI = function(path, api) {
+        return path.indexOf(api) === (path.length - api.length);
+      };
+
+      var contentType = 'application/json';
+      var body = '';
+
+      try {
+        if (matchesAPI(path, '_bulk') || matchesAPI(path, '_msearch')) {
+          contentType = 'application/x-ndjson';
+          body = $scope.editor.getStringValue().split('\n').map(function(line) {
+            return line === '' ? '\n' : JSON.stringify(JSON.parse(line));
+          }).join('\n');
+        } else {
+          body = JSON.stringify($scope.editor.getValue(), undefined, 1);
+        }
+      } catch (e) {
+        AlertService.error('Unexpected content format for [' + path + ']');
+        return;
+      }
+
+      var curl = 'curl';
+      curl += ' -H \'Content-type: ' + contentType + '\'';
+      curl += ' -X' + method + ' \'' + $scope.host + path + '\'';
       if (['POST', 'PUT'].indexOf(method) >= 0) {
         curl += ' -d \'' + body + '\'';
       }
@@ -2656,29 +2679,19 @@ angular.module('cerebro').filter('timeInterval', function() {
 
 });
 
-function URLAutocomplete(mappings) {
+function URLAutocomplete(indices) {
 
   var PATHS = [
-    // Suggest
-    '_suggest',
-    '{index}/_suggest',
     // Multi Search
     '_msearch',
     '{index}/_msearch',
-    '{index}/{type}/_msearch',
     '_msearch/template',
     '{index}/_msearch/template',
-    '{index}/{type}/_msearch/template',
     // Search
     '_search',
     '{index}/_search',
-    '{index}/{type}/_search',
     '_search/template',
-    '{index}/_search/template',
-    '{index}/{type}/_search/template',
-    '_search/exists',
-    '{index}/_search/exists',
-    '{index}/{type}/_search/exists'
+    '{index}/_search/template'
   ];
 
   var format = function(previousTokens, suggestedToken) {
@@ -2699,7 +2712,7 @@ function URLAutocomplete(mappings) {
     var suggestedTokenIndex = pathTokens.length - 1;
 
     /**
-     * Replaces the variables on suggestedPathTokens({index}, {type}...) for
+     * Replaces the variables on suggestedPathTokens({index}) for
      * actual values extracted from pathTokens
      *
      * @param {Array} pathTokens tokens for the path to be suggested
@@ -2730,16 +2743,10 @@ function URLAutocomplete(mappings) {
       var valid = true;
       suggestedPathTokens.forEach(function(token, index) {
         if (valid && index < pathTokens.length - 1) {
-          switch (token) {
-            case '{index}':
-              valid = Object.keys(mappings).indexOf(pathTokens[index]) >= 0;
-              break;
-            case '{type}':
-              var types = mappings[pathTokens[index - 1]].types;
-              valid = types.indexOf(pathTokens[index]) >= 0;
-              break;
-            default:
-              valid = pathTokens[index] === token;
+          if (token === '{index}') {
+            valid = indices.indexOf(pathTokens[index]) >= 0;
+          } else {
+            valid = pathTokens[index] === token;
           }
         }
       });
@@ -2763,20 +2770,12 @@ function URLAutocomplete(mappings) {
           suggestedPathTokens
         );
         var suggestedToken = suggestedPathTokens[suggestedTokenIndex];
-        switch (suggestedToken) {
-          case '{index}':
-            Object.keys(mappings).forEach(function(index) {
-              addIfNotPresent(alternatives, format(pathTokens, index));
-            });
-            break;
-          case '{type}':
-            var pathIndex = pathTokens[suggestedTokenIndex - 1];
-            mappings[pathIndex].types.forEach(function(type) {
-              addIfNotPresent(alternatives, format(pathTokens, type));
-            });
-            break;
-          default:
-            addIfNotPresent(alternatives, format(pathTokens, suggestedToken));
+        if (suggestedToken === '{index}') {
+          indices.forEach(function(index) {
+            addIfNotPresent(alternatives, format(pathTokens, index));
+          });
+        } else {
+          addIfNotPresent(alternatives, format(pathTokens, suggestedToken));
         }
       }
     });
